@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { QoderAdapter, toQoderPermissionMode } from '../../../src/agent/qodercli/adapter';
+import { buildQoderProcessEnv, QoderAdapter, toQoderPermissionMode } from '../../../src/agent/qodercli/adapter';
 
 describe('QoderAdapter', () => {
   it('identifies itself as qodercli', () => {
@@ -11,6 +11,14 @@ describe('QoderAdapter', () => {
   it('requires cwd before running', () => {
     const adapter = new QoderAdapter({ binary: 'qodercli' });
     expect(() => adapter.run({ prompt: 'hi' } as never)).toThrow(/cwd is required/);
+  });
+
+  it('drops the parent Qoder SDK entrypoint marker for nested CLI runs', () => {
+    const env = buildQoderProcessEnv({
+      ...process.env,
+      QODER_AGENT_SDK_ENTRYPOINT: 'sdk-ts',
+    });
+    expect(env.QODER_AGENT_SDK_ENTRYPOINT).toBeUndefined();
   });
 });
 

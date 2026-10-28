@@ -37,6 +37,7 @@ interface FakeLarkChannel {
   botIdentity: { openId: string; name: string };
   handlers: MessageHandlerMap;
   sent: Array<{ chatId: string; content: unknown; options?: unknown }>;
+  updatedCards: Array<{ messageId: string; card: object }>;
   rawClient: {
     request: ReturnType<typeof vi.fn>;
     application: {
@@ -64,13 +65,15 @@ interface FakeLarkChannel {
   getChatMode(chatId: string): Promise<'group' | 'topic'>;
   getConnectionStatus(): { state: 'connected'; reconnectAttempts: number };
   send(chatId: string, content: unknown, options?: unknown): Promise<{ messageId: string }>;
-  stream(chatId: string, input: unknown, options?: unknown): Promise<void>;
+  stream(chatId: string, input: unknown, options?: unknown): Promise<{ messageId: string } | void>;
+  updateCard(messageId: string, card: object): Promise<void>;
   addReaction(messageId: string, emojiType: string): Promise<string>;
   removeReaction(messageId: string, reactionId: string): Promise<void>;
 }
 
 type StreamFn = FakeLarkChannel['stream'];
 type SendFn = FakeLarkChannel['send'];
+type UpdateCardFn = FakeLarkChannel['updateCard'];
 
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -427,17 +430,104 @@ describe('markdown stream startup failures', () => {
     expect(finalJson).not.toContain('progress update');
     expect(h.channel.sent[0]?.options).toMatchObject({ replyTo: 'om_card_final' });
   });
+
+  it('replaces a Qoder progress stream with the final answer in place', async () => {
+    const h = await createHarness({
+      agentKind: 'qodercli',
+      events: [
+        { type: 'text', delta: 'progress update' },
+        { type: 'tool_use', id: 'tool-1', name: 'Bash', input: { command: 'pwd' } },
+        { type: 'tool_result', id: 'tool-1', output: '/repo', isError: false },
+        { type: 'text', delta: 'still progress ' },
+        { type: 'text', delta: 'QODER_FINAL_SENTINEL' },
+        { type: 'final_text', content: 'QODER_FINAL_SENTINEL' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        await producer?.({ setContent: vi.fn(async () => {}) });
+        return { messageId: 'om_qoder_stream' };
+      },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_qoder_final', 'run'));
+    await waitFor(() => h.channel.updatedCards.length === 1);
+
+    const finalJson = JSON.stringify(h.channel.updatedCards[0]?.card);
+    expect(h.channel.updatedCards[0]?.messageId).toBe('om_qoder_stream');
+    expect(finalJson).toContain('QODER_FINAL_SENTINEL');
+    expect(finalJson).not.toContain('progress update');
+    expect(finalJson).not.toContain('still progress');
+    expect(finalJson).not.toContain('Bash');
+    expect(h.channel.sent).toHaveLength(0);
+  });
+
+  it('does not duplicate the Qoder fallback when stream startup fails', async () => {
+    const h = await createHarness({
+      agentKind: 'qodercli',
+      events: [
+        { type: 'text', delta: 'progress update' },
+        { type: 'text', delta: 'QODER_STARTUP_FALLBACK' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      stream: async () => {
+        throw new Error('stream startup failed');
+      },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_qoder_startup_fallback', 'run'));
+    await waitFor(() => h.channel.sent.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    expect(h.channel.sent).toHaveLength(1);
+    expect(lastMarkdown(h.channel)).toContain('QODER_STARTUP_FALLBACK');
+  });
+
+  it('sends the Qoder final answer when the terminal card update fails', async () => {
+    const h = await createHarness({
+      agentKind: 'qodercli',
+      events: [
+        { type: 'text', delta: 'progress update' },
+        { type: 'tool_use', id: 'tool-1', name: 'Bash', input: { command: 'pwd' } },
+        { type: 'text', delta: 'QODER_FALLBACK_SENTINEL' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        await producer?.({ setContent: vi.fn(async () => {}) });
+        return { messageId: 'om_qoder_stale_stream' };
+      },
+      updateCard: async () => {
+        throw new Error('streaming card expired');
+      },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_qoder_fallback', 'run'));
+    await waitFor(() => h.channel.sent.length === 1);
+
+    expect(lastMarkdown(h.channel)).toContain('QODER_FALLBACK_SENTINEL');
+    expect(lastMarkdown(h.channel)).not.toContain('progress update');
+    expect(h.channel.sent[0]?.options).toMatchObject({ replyTo: 'om_qoder_fallback' });
+  });
 });
 
 async function createHarness(options: {
   reactionCreate?: () => Promise<{ data: { reaction_id: string } }>;
   stream?: StreamFn;
   send?: SendFn;
+  updateCard?: UpdateCardFn;
   /** One run's events, or one array per run. */
   events?: FakeAgentEvents;
   messageReply?: 'card' | 'markdown' | 'text';
   /** Codex holds its answer back for a dedicated final reply; Claude streams it. */
-  agentKind?: 'claude' | 'codex';
+  agentKind?: 'claude' | 'codex' | 'qodercli';
 } = {}): Promise<{
   tmp: TmpProfile;
   channel: FakeLarkChannel;
@@ -476,8 +566,8 @@ async function createHarness(options: {
   const sessions = new SessionStore(join(tmp.profile, 'sessions.json'));
   const workspaces = new WorkspaceStore(join(tmp.profile, 'workspaces.json'));
   const agent = new FakeAgentAdapter({
-    id: 'codex',
-    displayName: 'Codex',
+    id: options.agentKind ?? 'codex',
+    displayName: options.agentKind ?? 'Codex',
     events: options.events ?? [
       [
         {
@@ -528,12 +618,15 @@ function createFakeLarkChannel(harnessOptions: {
   reactionCreate?: () => Promise<{ data: { reaction_id: string } }>;
   stream?: StreamFn;
   send?: SendFn;
+  updateCard?: UpdateCardFn;
 } = {}): FakeLarkChannel {
   const handlers: MessageHandlerMap = {};
   const sent: FakeLarkChannel['sent'] = [];
+  const updatedCards: FakeLarkChannel['updatedCards'] = [];
   const channel: FakeLarkChannel = {
     handlers,
     sent,
+    updatedCards,
     botIdentity: { openId: 'ou_bot', name: 'Bridge' },
     rawClient: {
       request: vi.fn(async () => ({ data: { items: [] } })),
@@ -577,6 +670,10 @@ function createFakeLarkChannel(harnessOptions: {
     stream: harnessOptions.stream ?? (async () => {
       await new Promise<void>(() => {});
     }),
+    async updateCard(messageId, card) {
+      updatedCards.push({ messageId, card });
+      if (harnessOptions.updateCard) return harnessOptions.updateCard(messageId, card);
+    },
     async addReaction(messageId, emojiType) {
       const r = await channel.rawClient.im.v1.messageReaction.create({
         path: { message_id: messageId },

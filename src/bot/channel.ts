@@ -1051,6 +1051,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     if (getShowToolCalls(controls.cfg)) return state;
     return { ...state, blocks: state.blocks.filter((b) => b.kind !== 'tool') };
   };
+  const finalStateForAgent = (state: RunState): RunState => {
+    const filtered = filterForPrefs(state);
+    return controls.profileConfig.agentKind === 'qodercli' ? finalAnswerOnlyState(filtered, true) : filtered;
+  };
   const cardRenderOptions = callbackAuth
     ? {
         signCallback: (action: string) =>
@@ -1114,7 +1118,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           channel,
           chatId,
           scope,
-          state: finalAnswerOnlyState(finalState),
+          state: finalAnswerOnlyState(
+            finalState,
+            controls.profileConfig.agentKind === 'qodercli',
+          ),
           replyMode,
           sendOpts,
           cardRenderOptions,
@@ -1127,6 +1134,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     if (replyMode === 'card') {
       let latestState: RunState = initialState;
       let producerStarted = false;
+      let fallbackSent = false;
       let cardCtrl:
         | { update(next: object | ((current: object) => object)): Promise<void> }
         | undefined;
@@ -1170,20 +1178,37 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           producerStarted: () => producerStarted,
           fallback: async (state) => {
             if (controls.profileConfig.agentKind === 'codex') return;
-            if (renderText(filterForPrefs(state)).trim() === '') return;
+            const finalState = finalStateForAgent(state);
+            if (renderText(finalState).trim() === '') return;
             await channel.send(
               chatId,
-              { card: renderCard(filterForPrefs(state), cardRenderOptions) },
+              { card: renderCard(finalState, cardRenderOptions) },
               sendOpts,
             );
+            fallbackSent = true;
           },
         });
       } catch (err) {
-        if (controls.profileConfig.agentKind !== 'codex') throw err;
+        if (
+          controls.profileConfig.agentKind !== 'codex' &&
+          controls.profileConfig.agentKind !== 'qodercli'
+        ) throw err;
         log.fail('stream', err, { mode: replyMode, step: 'progress-stream' });
       }
       await recallIfEmptyStreamedReply(channel, progress, filterForPrefs(latestState), scope);
-      if (controls.profileConfig.agentKind === 'codex') {
+      if (controls.profileConfig.agentKind === 'qodercli') {
+        await finalizeQoderStreamedReply({
+          channel,
+          progress,
+          chatId,
+          scope,
+          state: finalStateForAgent(latestState),
+          replyMode,
+          sendOpts,
+          cardRenderOptions,
+          fallbackSent,
+        });
+      } else if (controls.profileConfig.agentKind === 'codex') {
         await sendFinalReply({
           channel,
           chatId,
@@ -1197,6 +1222,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     } else if (replyMode === 'markdown') {
       let latestState: RunState = initialState;
       let producerStarted = false;
+      let fallbackSent = false;
       let markdownCtrl: { setContent(markdown: string): Promise<void> } | undefined;
       const progress = createLazyProgressStream(scope, replyMode, () =>
         channel.stream(
@@ -1235,18 +1261,34 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           producerStarted: () => producerStarted,
           fallback: async (state) => {
             if (controls.profileConfig.agentKind === 'codex') return;
-            const body = renderText(filterForPrefs(state));
+            const body = renderText(finalStateForAgent(state));
             if (body.trim()) {
               await channel.send(chatId, { markdown: body }, sendOpts);
+              fallbackSent = true;
             }
           },
         });
       } catch (err) {
-        if (controls.profileConfig.agentKind !== 'codex') throw err;
+        if (
+          controls.profileConfig.agentKind !== 'codex' &&
+          controls.profileConfig.agentKind !== 'qodercli'
+        ) throw err;
         log.fail('stream', err, { mode: replyMode, step: 'progress-stream' });
       }
       await recallIfEmptyStreamedReply(channel, progress, filterForPrefs(latestState), scope);
-      if (controls.profileConfig.agentKind === 'codex') {
+      if (controls.profileConfig.agentKind === 'qodercli') {
+        await finalizeQoderStreamedReply({
+          channel,
+          progress,
+          chatId,
+          scope,
+          state: finalStateForAgent(latestState),
+          replyMode,
+          sendOpts,
+          cardRenderOptions,
+          fallbackSent,
+        });
+      } else if (controls.profileConfig.agentKind === 'codex') {
         await sendFinalReply({
           channel,
           chatId,
@@ -1276,7 +1318,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         state:
           controls.profileConfig.agentKind === 'codex'
             ? finalAnswerOnlyState(filterForPrefs(finalState))
-            : filterForPrefs(finalState),
+            : finalStateForAgent(finalState),
         replyMode,
         sendOpts,
         cardRenderOptions,
@@ -1390,6 +1432,38 @@ function finalReplyState(progress: LazyProgressStream, state: RunState): RunStat
     terminal: 'done',
     errorMsg: undefined,
   };
+}
+
+async function finalizeQoderStreamedReply(input: {
+  channel: LarkChannel;
+  progress: LazyProgressStream;
+  chatId: string;
+  scope: string;
+  state: RunState;
+  replyMode: 'card' | 'markdown';
+  sendOpts: { replyTo: string; replyInThread?: boolean };
+  cardRenderOptions: { signCallback?: (action: string) => string };
+  fallbackSent: boolean;
+}): Promise<void> {
+  if (input.fallbackSent || !input.progress.opened() || input.progress.abandoned()) return;
+  const result = await input.progress.settled.catch(() => undefined);
+  const messageId = (result as { messageId?: string } | undefined)?.messageId;
+  if (messageId) {
+    try {
+      await input.channel.updateCard(
+        messageId,
+        renderCard(input.state, input.cardRenderOptions),
+      );
+      return;
+    } catch (err) {
+      log.warn('outbound', 'final-card-update-failed', {
+        scope: input.scope,
+        messageId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  await sendFinalReply(input);
 }
 
 /**

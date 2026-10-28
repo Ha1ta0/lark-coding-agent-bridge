@@ -249,12 +249,16 @@ export class CotPublisher {
   }
 }
 
-export function finalAnswerOnlyState(state: RunState): RunState {
+export function finalAnswerOnlyState(state: RunState, lastTextOnly = false): RunState {
+  const textBlocks = state.blocks.filter((b) => b.kind === 'text');
+  const lastTextBlock = textBlocks[textBlocks.length - 1];
   return {
     ...state,
     blocks: state.finalText
       ? [{ kind: 'text', content: state.finalText, streaming: false }]
-      : state.blocks.filter((b) => b.kind === 'text'),
+      : lastTextOnly && lastTextBlock
+        ? [{ ...lastTextBlock, streaming: false }]
+        : textBlocks,
     reasoning: { content: '', active: false },
     footer: null,
   };

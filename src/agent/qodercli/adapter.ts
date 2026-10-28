@@ -3,8 +3,8 @@ import type { Readable, Writable } from 'node:stream';
 import { log } from '../../core/logger';
 import { mergeProcessEnv, spawnProcess, type SpawnedProcessByStdio } from '../../platform/spawn';
 import { buildBridgeSystemPrompt } from '../bridge-system-prompt';
-import { translateEvent } from '../claude/stream-json';
 import { buildLarkChannelEnv, type LarkChannelEnvContext } from '../lark-channel-env';
+import { translateQoderEvent } from './stream-json';
 import { checkAgentAvailability, type AgentAvailability } from '../preflight';
 import {
   type AgentAdapter,
@@ -33,8 +33,8 @@ type QoderPermissionMode = 'default' | 'accept_edits' | 'bypass_permissions';
 /**
  * Adapter for Qoder CLI (`qodercli`). qodercli mirrors Claude Code's
  * headless interface (`-p --output-format stream-json --resume <id>` and the
- * same stream-json event schema), so this adapter reuses the Claude
- * stream-json translator. Notable deltas from ClaudeAdapter:
+ * same stream-json event schema), so this adapter extends the Claude
+ * stream-json translator with Qoder-specific final/error handling. Notable deltas from ClaudeAdapter:
  *
  * - No `--verbose` flag: qodercli emits full stream-json events without it.
  * - No `--append-system-prompt-file`: the bridge system prompt is prepended
@@ -91,7 +91,7 @@ export class QoderAdapter implements AgentAdapter {
 
     const child = spawnProcess(this.binary, args, {
       cwd: opts.cwd,
-      env: mergeProcessEnv(process.env, buildLarkChannelEnv(this.larkChannel)),
+      env: buildQoderProcessEnv(process.env, this.larkChannel),
       stdio: ['pipe', 'pipe', 'pipe'],
     }) as QoderChild;
 
@@ -189,6 +189,16 @@ export class QoderAdapter implements AgentAdapter {
   }
 }
 
+export function buildQoderProcessEnv(
+  base: NodeJS.ProcessEnv,
+  larkChannel?: LarkChannelEnvContext,
+): NodeJS.ProcessEnv {
+  const env = mergeProcessEnv(base, buildLarkChannelEnv(larkChannel));
+  // A nested Qoder launch must not inherit Qoder Desktop's SDK entrypoint marker.
+  delete env.QODER_AGENT_SDK_ENTRYPOINT;
+  return env;
+}
+
 /** Map the bridge's Claude-shaped permission mode onto qodercli's values. */
 export function toQoderPermissionMode(mode?: ClaudePermissionMode): QoderPermissionMode {
   switch (mode) {
@@ -238,7 +248,7 @@ async function* createEventStream(
       } catch {
         continue;
       }
-      yield* translateEvent(parsed);
+      yield* translateQoderEvent(parsed);
     }
   } finally {
     if (silentExitTimer) clearTimeout(silentExitTimer);

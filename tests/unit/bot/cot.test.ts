@@ -65,9 +65,10 @@ describe('COT event mapping', () => {
     expect(JSON.parse(result?.content ?? '{}').content).toBe('workspace');
   });
 
-  it('derives final answer state from text blocks only', () => {
+  it('keeps only the last text block when final-answer-only mode requests it', () => {
     const state: RunState = {
       blocks: [
+        { kind: 'text', content: 'progress', streaming: false },
         { kind: 'tool', tool: { id: 'tool', name: 'command_execution', input: {}, status: 'done' } },
         { kind: 'text', content: 'final', streaming: false },
       ],
@@ -77,6 +78,14 @@ describe('COT event mapping', () => {
     };
 
     expect(finalAnswerOnlyState(state)).toMatchObject({
+      blocks: [
+        { kind: 'text', content: 'progress' },
+        { kind: 'text', content: 'final' },
+      ],
+      reasoning: { content: '', active: false },
+      footer: null,
+    });
+    expect(finalAnswerOnlyState(state, true)).toMatchObject({
       blocks: [{ kind: 'text', content: 'final' }],
       reasoning: { content: '', active: false },
       footer: null,
